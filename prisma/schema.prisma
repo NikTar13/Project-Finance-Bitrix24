@@ -1,0 +1,187 @@
+// ============================================================================
+//  Project Finance for Bitrix24 — Prisma schema
+//  8 моделей: users, projects, project_users, income_categories,
+//  expense_categories, incomes, expenses, audit_logs
+//
+//  Финансовая корректность: все суммы хранятся в КОПЕЙКАХ (Int),
+//  чтобы исключить ошибки округления float. В API/UI конвертируются в рубли.
+//  (Так делают реальные финтех-системы.)
+//
+//  Примечание: SQLite не поддерживает enum — используем String + типобезопасные
+//  константы в lib/constants.ts. При миграции на PostgreSQL можно вернуть enum.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+//  Сотрудники — получаются из Bitrix24 (user.get / user.current).
+//  Здесь хранится локальное зеркало + роль в приложении.
+//  role: ADMIN | FINANCIER | MANAGER | EMPLOYEE
+// ---------------------------------------------------------------------------
+model User {
+  id           String   @id @default(cuid())
+  bitrixUserId String   @unique // ID пользователя в портале Bitrix24
+  email        String   @unique
+  name         String
+  position     String?
+  avatarUrl    String?
+  role         String   @default("EMPLOYEE") // Role enum в lib/constants.ts
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  projectAssignments ProjectUser[]
+  incomes            Income[]
+  expenses           Expense[]
+  incomeCategories   IncomeCategory[]
+  expenseCategories  ExpenseCategory[]
+  auditLogs          AuditLog[]
+
+  @@index([isActive])
+}
+
+// ---------------------------------------------------------------------------
+//  Проекты — получаются из Bitrix24 (sonet_group.get / project).
+//  Финансовые данные хранятся ТОЛЬКО в нашей БД (ручной учёт по ТЗ).
+//  status: ACTIVE | ON_HOLD | CLOSED
+// ---------------------------------------------------------------------------
+model Project {
+  id              String   @id @default(cuid())
+  bitrixProjectId String   @unique // ID проекта/группы в Bitrix24
+  name            String
+  description     String?
+  status          String   @default("ACTIVE") // ProjectStatus
+  startedAt       DateTime?
+  closedAt        DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  assignments ProjectUser[]
+  incomes     Income[]
+  expenses    Expense[]
+
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+//  Связь проект ↔ сотрудник (many-to-many с ролями внутри проекта).
+//  projectRole: PROJECT_MANAGER | DEVELOPER | QA | DESIGNER | ANALYST
+// ---------------------------------------------------------------------------
+model ProjectUser {
+  id           String   @id @default(cuid())
+  projectId    String
+  userId       String
+  projectRole  String   @default("DEVELOPER") // ProjectRole
+  assignedAt   DateTime @default(now())
+  assignedById String?
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+//  Статьи доходов — есть предустановленные + можно добавить свои.
+// ---------------------------------------------------------------------------
+model IncomeCategory {
+  id         String   @id @default(cuid())
+  name       String   @unique
+  isDefault  Boolean  @default(false) // предустановленная (не удаляется)
+  createdById String?
+  createdAt  DateTime @default(now())
+
+  createdBy User?    @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  incomes   Income[]
+
+  @@index([isDefault])
+}
+
+// ---------------------------------------------------------------------------
+//  Статьи расходов — 5 предустановленных по ТЗ + пользовательские.
+// ---------------------------------------------------------------------------
+model ExpenseCategory {
+  id         String   @id @default(cuid())
+  name       String   @unique
+  isDefault  Boolean  @default(false)
+  color      String? // hex для графиков
+  createdById String?
+  createdAt  DateTime @default(now())
+
+  createdBy User?      @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  expenses  Expense[]
+
+  @@index([isDefault])
+}
+
+// ---------------------------------------------------------------------------
+//  Доходы — ручной учёт. amount в копейках.
+// ---------------------------------------------------------------------------
+model Income {
+  id          String   @id @default(cuid())
+  projectId   String
+  amount      Int // копейки
+  date        DateTime
+  categoryId  String
+  comment     String?
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project  Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  category IncomeCategory @relation(fields: [categoryId], references: [id])
+  createdBy User?         @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([projectId, date])
+  @@index([categoryId])
+}
+
+// ---------------------------------------------------------------------------
+//  Расходы — ручной учёт. amount в копейках.
+// ---------------------------------------------------------------------------
+model Expense {
+  id          String   @id @default(cuid())
+  projectId   String
+  amount      Int // копейки
+  date        DateTime
+  categoryId  String
+  comment     String?
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project  Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  category ExpenseCategory @relation(fields: [categoryId], references: [id])
+  createdBy User?          @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([projectId, date])
+  @@index([categoryId])
+}
+
+// ---------------------------------------------------------------------------
+//  Журнал аудита — кто / когда / что изменил. Демонстрирует зрелость решения.
+//  action: CREATE | UPDATE | DELETE
+// ---------------------------------------------------------------------------
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String // AuditAction
+  entityType String // Income | Expense | Project | Category | ...
+  entityId   String?
+  entityName String?
+  details    String // JSON-строка с деталями изменения
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
